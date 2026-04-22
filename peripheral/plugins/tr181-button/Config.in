@@ -1,0 +1,32 @@
+config PACKAGE_tr181-button
+    tristate
+    select SAH_AMX_TR181_BUTTON
+
+if PACKAGE_tr181-button
+
+menu "Select tr181-button build options"
+    depends on PACKAGE_tr181-button
+
+config SAH_AMX_TR181_BUTTON
+    bool "TR-181 Device.X_PRPLWARE-COM_Buttons datamodel implementation"
+    default y
+
+config SAH_AMX_TR181_BUTTON_RUN_AS_USER
+    string "User will be used for the tr181-button plugin"
+    default "tr181_app"
+
+config SAH_AMX_TR181_BUTTON_RUN_AS_GROUP
+    string "Group will be used for the tr181-button plugin"
+    default "tr181_app"
+
+config SAH_AMX_TR181_BUTTON_START_ORDER
+    int "Start up order for the tr181 button plugin"
+    default 40
+
+config SAH_AMX_TR181_BUTTON_STOP_ORDER
+    int "Shutdown order for the tr181 button plugin"
+    default 60
+
+endmenu
+
+endif

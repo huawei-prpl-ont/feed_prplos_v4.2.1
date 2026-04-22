@@ -1,0 +1,32 @@
+config PACKAGE_tr181-bridging
+    tristate
+    select SAH_AMX_TR181_BRIDGING
+
+if PACKAGE_tr181-bridging
+
+menu "Select tr181-bridging build options"
+    depends on PACKAGE_tr181-bridging
+
+config SAH_AMX_TR181_BRIDGING
+    bool "Build the TR-181 compatible bridging manager"
+    default y
+
+config SAH_AMX_TR181_BRIDGING_RUN_AS_USER
+    string "User will be used for the bridging manager plugin"
+    default "tr181_app"
+
+config SAH_AMX_TR181_BRIDGING_RUN_AS_GROUP
+    string "Group will be used for the bridging manager plugin"
+    default "tr181_app"
+
+config SAH_AMX_TR181_BRIDGING_START_ORDER
+    int "Init start up order for the bridging manager plugin"
+    default 22
+
+config SAH_AMX_TR181_BRIDGING_STOP_ORDER
+    int "Init stop order for the bridging manager plugin"
+    default 76
+
+endmenu
+
+endif
