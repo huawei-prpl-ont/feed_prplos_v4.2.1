@@ -1,0 +1,91 @@
+#!/bin/sh /etc/rc.common
+
+START=80
+
+extra_command "enter_application" "Switches EFR32 into application mode"
+extra_command "enter_bootloader" "Switches EFR32 into bootloader mode"
+
+board_init() {
+	. /lib/functions.sh
+
+	local board_name=$(board_name)
+
+	case "$board_name" in
+	"prpl,freedom")
+		local soc_base expander_base
+
+		for chip in /sys/class/gpio/gpiochip*; do
+			if [ -f "$chip/label" ]; then
+				local label="$(cat "$chip/label")"
+				local base="$(cat "$chip/base")"
+				if [ "$label" = "1000000.pinctrl" ]; then
+					soc_base="$base"
+				else
+					expander_base="$base"
+				fi
+			fi
+		done
+
+		if [ -z "$soc_base" ] || [ -z "$expander_base" ]; then
+			echo "Error: Failed to detect soc_base or expander_base." >&2
+			exit 1
+		fi
+
+		efr32_gpio_reset=$((expander_base + 6))      # EFR32 RESETn pin connected to P05 pin on TCA6416 GPIO expander
+		efr32_gpio_fwupgrade=$((soc_base + 21))      # EFR32 PC04 pin connected to IPQ GPIO pin 21
+		;;
+	"mxl,lgm")
+		efr32_gpio_reset=967      # EFR32 RESETn pin connected to MxL GPIO 39
+		efr32_gpio_fwupgrade=989  # EFR32 PC04 pin connected to MxL GPIO 61
+		;;
+	*)
+		echo "Unsupported board: $board_name"
+		exit 1
+		;;
+	esac
+}
+
+gpio_init() {
+	echo $efr32_gpio_reset >/sys/class/gpio/export
+	echo $efr32_gpio_fwupgrade >/sys/class/gpio/export
+
+	echo out >/sys/class/gpio/gpio${efr32_gpio_reset}/direction
+	echo out >/sys/class/gpio/gpio${efr32_gpio_fwupgrade}/direction
+}
+
+gpio_deinit() {
+	echo $efr32_gpio_reset >/sys/class/gpio/unexport
+	echo $efr32_gpio_fwupgrade >/sys/class/gpio/unexport
+}
+
+enter_application() {
+	board_init
+	gpio_init
+
+	echo 0 >/sys/class/gpio/gpio${efr32_gpio_reset}/value
+	echo 1 >/sys/class/gpio/gpio${efr32_gpio_fwupgrade}/value
+
+	sleep .01
+
+	echo 1 >/sys/class/gpio/gpio${efr32_gpio_reset}/value
+
+	gpio_deinit
+}
+
+enter_bootloader() {
+	board_init
+	gpio_init
+
+	echo 0 >/sys/class/gpio/gpio${efr32_gpio_reset}/value
+	echo 0 >/sys/class/gpio/gpio${efr32_gpio_fwupgrade}/value
+
+	sleep .01
+
+	echo 1 >/sys/class/gpio/gpio${efr32_gpio_reset}/value
+
+	gpio_deinit
+}
+
+boot() {
+	enter_application
+}
