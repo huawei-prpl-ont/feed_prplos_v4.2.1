@@ -1,0 +1,40 @@
+From b98a3e0d1f28b077595611eb7878e9ba6f19961d Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Wed, 8 Apr 2026 20:32:25 +0800
+Subject: [PATCH] Fix PPW-1510: IP.Interface Status Remains "Up" When
+ Lower-Layer Physical Device Is Down
+
+When a lower-layer physical device changes state, `status_ext_updated_cb`
+now propagates both "Up" and "Down" status to `IP.Interface.Status`.
+This ensures that the interface status reflects the state of the
+underlying physical device.
+
+Fixes: PPW-1510
+References: https://prplfoundationcloud.atlassian.net/browse/PPW-1510
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ src/ip_manager_interface.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/ip_manager_interface.c b/src/ip_manager_interface.c
+index 313dd82..6460cf4 100644
+--- a/src/ip_manager_interface.c
++++ b/src/ip_manager_interface.c
+@@ -629,9 +629,13 @@ static void status_ext_updated_cb(UNUSED const char* sig_name,
+     SAH_TRACEZ_INFO(ME, "IP interface '%s' Status_ext changing to '%s'",
+                     intf->obj->name, status);
+ 
+-    when_false_trace(netdev_name_known(intf->obj), exit, INFO, "NetDev name not known, can't set IPv6 addresses on interface '%s'", intf->obj->name);
+     if(strcmp(status, "Up") == 0) {
++        ip_manager_intf_set_status(intf->obj, STATUS_UP);
++        when_false_trace(netdev_name_known(intf->obj), exit, INFO, "NetDev name not known, can't set IPv6 addresses on interface '%s'", intf->obj->name);
+         ipv6_set_addresses(intf);
++    } else {
++        when_false_trace(netdev_name_known(intf->obj), exit, INFO, "NetDev name not known on interface '%s'", intf->obj->name);
++        ip_manager_intf_set_status(intf->obj, STATUS_DOWN);
+     }
+ 
+ exit:
+-- 
+2.51.0.windows.1
+

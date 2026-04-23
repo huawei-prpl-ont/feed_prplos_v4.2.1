@@ -1,0 +1,32 @@
+From b9e385a5d4a235a887ec27e3c82480f43d134bad Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Fri, 27 Mar 2026 10:47:20 +0800
+Subject: [PATCH] Problem: Static `PCP.Client.{i}.Server.{i}` remains
+ `Disabled` after system boot.
+
+Cause: `start_server` in `dm_server_event.c` checks `client_is_ready()` before the client is marked ready, so the servers fail to start.
+
+Solution: Set `pcp_cfg->ready = true` before enabling servers.
+
+Issue: PPW-1700 Static `PCP.Client.{i}.Server.{i}` remains `Disabled` after system boot. [fix]
+---
+ src/dm_client_event.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/dm_client_event.c b/src/dm_client_event.c
+index 82edd89..7094824 100644
+--- a/src/dm_client_event.c
++++ b/src/dm_client_event.c
+@@ -123,8 +123,8 @@ static void enable_1_client(client_t* pcp_cfg) {
+     }
+ 
+ skip_dhcpv6:
+-    amxd_object_for_all(pcp_cfg->object, "Server.[Enable==true && Origin=='Static'].", enable_server, NULL);
+     pcp_cfg->ready = true;
++    amxd_object_for_all(pcp_cfg->object, "Server.[Enable==true && Origin=='Static'].", enable_server, NULL);
+     set_status(pcp_cfg->object, SUCCESS);
+ }
+ 
+-- 
+2.51.0.windows.1
+

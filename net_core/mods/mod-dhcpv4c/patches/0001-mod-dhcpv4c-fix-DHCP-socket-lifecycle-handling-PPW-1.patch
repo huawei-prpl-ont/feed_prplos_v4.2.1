@@ -1,0 +1,350 @@
+From 43bb794feef69f50433b0b5ed8d2780ea29fa73a Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Wed, 22 Apr 2026 16:21:38 +0800
+Subject: [PATCH] mod-dhcpv4c: fix DHCP socket lifecycle handling (PPW-1578)
+
+Problem:
+When DHCP interfaces are stopped, deleted, or recreated with the same
+netdev name under a different TR-181 path, raw and UDP sockets can remain
+registered in the event loop. The stale descriptors can later be used by
+the raw handler, causing repeated errors. Startup also continued after
+socket setup failures, leaving partially initialized states.
+
+Proposed Solution:
+1. Release active leases and stop both DHCP sockets when deleting an
+   interface.
+2. Remove stale interfaces that share the netdev name before starting a
+   new lease on another TR-181 path.
+3. Make lease enable fail when raw or UDP socket setup fails, clean up
+   partial socket state, and report the failure to the start call.
+4. Update tests to cover these scenarios and verify proper error handling.
+
+Fixes: PPW-1578
+References: https://prplfoundationcloud.atlassian.net/browse/PPW-1578
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ src/dhcp_interface.c                          | 10 +++++-
+ src/dhcp_lease.c                              | 31 ++++++++++++++-----
+ src/dhcpv4c_main.c                            |  8 ++++-
+ test/mocks/common_functions.c                 | 20 ++++++++++++
+ test/mocks/common_functions.h                 |  1 +
+ test/mocks/mock_socket.c                      | 10 ++++--
+ test/mod-dhcpv4c_lease/test_lease.c           |  1 +
+ test/mod-dhcpv4c_packets/test_packets.c       | 11 ++++---
+ test/mod-dhcpv4c_start_stop/test_start_stop.c |  1 +
+ test/mod-dhcpv4c_stat/test_stat.c             | 28 ++---------------
+ 10 files changed, 78 insertions(+), 43 deletions(-)
+
+diff --git a/src/dhcp_interface.c b/src/dhcp_interface.c
+index 0765e5b..9ba8c5e 100644
+--- a/src/dhcp_interface.c
++++ b/src/dhcp_interface.c
+@@ -119,6 +119,13 @@ void dhcp_interface_delete(dhcp_interface_t** intf) {
+     when_null(intf, exit);
+     when_null(*intf, exit);
+ 
++    if((*intf)->lease) {
++        dhcp_state_release((*intf)->lease);
++    }
++
++    dhcp_interface_dhcp_socket_stop(*intf);
++    dhcp_interface_dhcp_raw_socket_stop(*intf);
++
+     amxc_llist_it_take(&(*intf)->it);
+     dhcp_lease_delete(&(*intf)->lease);
+     free((*intf)->intf_path);
+@@ -255,7 +262,8 @@ void dhcp_interface_dhcp_raw_read_handler(amxc_var_t* data) {
+ 
+     dhcp_packet_init(&packet);
+ 
+-    if(sys_recv_dhcp_packet_raw(intf->dhcp_raw_sock, &packet, BOOTREPLY) != 0) {
++    if((intf->dhcp_raw_sock < 0) ||
++       (sys_recv_dhcp_packet_raw(intf->dhcp_raw_sock, &packet, BOOTREPLY) != 0)) {
+         // TODO check for corrupt packet & update stats
+         goto exit;
+     }
+diff --git a/src/dhcp_lease.c b/src/dhcp_lease.c
+index a5bfca0..0e9c5cd 100644
+--- a/src/dhcp_lease.c
++++ b/src/dhcp_lease.c
+@@ -281,12 +281,23 @@ int dhcp_lease_enable(dhcp_lease_t* lease) {
+     if(intf->dhcp_sock >= 0) {
+         SAH_TRACEZ_INFO(ME, "DHCP Interface %s is already up", intf->name);
+     } else {
+-        dhcp_interface_dhcp_raw_socket(intf);
+-        dhcp_interface_dhcp_socket(intf);
+-        dhcp_interface_dhcp_socket_settos(intf);
++        ret = dhcp_interface_dhcp_raw_socket(intf);
++        when_failed_trace(ret, disable_lease, ERROR, "[%s] Failed to create raw DHCP socket", intf->name);
++
++        ret = dhcp_interface_dhcp_socket(intf);
++        when_failed_trace(ret, cleanup_raw_socket, ERROR, "[%s] Failed to create DHCP socket", intf->name);
++
++        (void) dhcp_interface_dhcp_socket_settos(intf);
+     }
+ 
+     ret = 0;
++    goto exit;
++
++cleanup_raw_socket:
++    dhcp_interface_dhcp_raw_socket_stop(intf);
++
++disable_lease:
++    lease->flags.flag_admin_enabled = 0;
+ 
+ exit:
+     return ret;
+@@ -300,14 +311,20 @@ int dhcp_lease_disable(dhcp_lease_t* lease) {
+     intf = lease->intf;
+     when_null_trace(intf, exit, ERROR, "No interface associated with this lease");
+ 
+-    if(intf->dhcp_sock < 0) {
++    if((intf->dhcp_sock < 0) && (intf->dhcp_raw_sock < 0)) {
++        lease->flags.flag_admin_enabled = 0;
+         SAH_TRACEZ_INFO(ME, "[%s] Interface already down", intf->name);
+         ret = 0;
+         goto exit;
+     }
+ 
+-    dhcp_interface_dhcp_socket_stop(intf);
+-    dhcp_interface_dhcp_raw_socket_stop(intf);
++    if(intf->dhcp_sock >= 0) {
++        dhcp_interface_dhcp_socket_stop(intf);
++    }
++
++    if(intf->dhcp_raw_sock >= 0) {
++        dhcp_interface_dhcp_raw_socket_stop(intf);
++    }
+ 
+     lease->flags.flag_admin_enabled = 0;
+ 
+@@ -526,4 +543,4 @@ void dhcp_lease_set_sent_options(dhcp_lease_t* lease, amxc_var_t* params) {
+ 
+ exit:
+     return;
+-}
+\ No newline at end of file
++}
+diff --git a/src/dhcpv4c_main.c b/src/dhcpv4c_main.c
+index 04d5bb4..2c472a1 100644
+--- a/src/dhcpv4c_main.c
++++ b/src/dhcpv4c_main.c
+@@ -103,6 +103,11 @@ static int dhcpv4c_set_state_start(UNUSED const char* function_name,
+         dhcp_interface_delete(&intf);
+     }
+     if(intf == NULL) {
++        // Also clean up any stale interface with the same netdev name but a different path
++        dhcp_interface_t* stale = dhcp_interface_find(intf_name);
++        if((stale != NULL) && (strcmp(stale->intf_path, intf_path) != 0)) {
++            dhcp_interface_delete(&stale);
++        }
+         dhcp_interface_new(&intf, intf_name, intf_path);
+     }
+     when_null_trace(intf, exit, ERROR, "Could not get/create dhcp interface for intf %s", intf_path);
+@@ -128,7 +133,8 @@ static int dhcpv4c_set_state_start(UNUSED const char* function_name,
+     intf->lease->release_reboot = GET_BOOL(args, "ReleaseOnReboot");
+ 
+     // apply config and start the actual dhcp process
+-    dhcp_lease_enable(intf->lease);
++    rv = dhcp_lease_enable(intf->lease);
++    when_failed_trace(rv, exit, ERROR, "Could not enable DHCP lease for intf %s", intf_name);
+     dhcp_lease_set_socket_opts(intf->lease, args);
+     dhcp_state_start(intf->lease);
+ 
+diff --git a/test/mocks/common_functions.c b/test/mocks/common_functions.c
+index af5e9d6..49d2399 100644
+--- a/test/mocks/common_functions.c
++++ b/test/mocks/common_functions.c
+@@ -66,6 +66,12 @@
+ 
+ #include "common_functions.h"
+ 
++static int event_loop_fd_handler(UNUSED const char* function_name,
++                                 UNUSED amxc_var_t* args,
++                                 UNUSED amxc_var_t* ret) {
++    return 0;
++}
++
+ static void dhcpv4c_config_add_options(amxc_var_t* data,
+                                        bool req_or_sent) {
+     const char* opts = req_or_sent ? "ReqOption" : "SentOption";
+@@ -106,6 +112,20 @@ exit:
+     return retval;
+ }
+ 
++int register_event_loop_mock_handlers(amxm_module_t* mod) {
++    int retval = -1;
++
++    when_null(mod, exit);
++
++    retval = amxm_module_add_function(mod, "event-loop-add-fd", event_loop_fd_handler);
++    when_failed(retval, exit);
++
++    retval = amxm_module_add_function(mod, "event-loop-rm-fd", event_loop_fd_handler);
++
++exit:
++    return retval;
++}
++
+ void add_data_to_var(amxc_var_t* data) {
+     amxc_var_set_type(data, AMXC_VAR_ID_HTABLE);
+     amxc_var_add_key(cstring_t, data, "intf_name", INTF_NAME);
+diff --git a/test/mocks/common_functions.h b/test/mocks/common_functions.h
+index 07869a3..c307c9e 100644
+--- a/test/mocks/common_functions.h
++++ b/test/mocks/common_functions.h
+@@ -77,6 +77,7 @@
+ #define WRONG_INTF_NAME         "ethx"
+ 
+ int start_stop_client(bool start, const char* intf);
++int register_event_loop_mock_handlers(amxm_module_t* mod);
+ void add_data_to_var(amxc_var_t* data);
+ 
+ 
+diff --git a/test/mocks/mock_socket.c b/test/mocks/mock_socket.c
+index 8f44b62..bbb9c4f 100644
+--- a/test/mocks/mock_socket.c
++++ b/test/mocks/mock_socket.c
+@@ -68,11 +68,11 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include <netinet/in.h>
+ #include <netinet/icmp6.h>
+ 
+-static int socket_counter = 1;
+ static dhcp_raw_packet_t raw1 =
+ {   0x01,                                                // opcode type
+     0x01,                                                // hardware address type
+@@ -385,8 +385,12 @@ int __wrap_recvfrom(UNUSED int sockfd, void* buf, size_t len, UNUSED int flags,
+ }
+ 
+ int __wrap_socket(UNUSED int domain, UNUSED int type, UNUSED int protocol) {
+-    socket_counter++;
+-    return socket_counter;
++    int fd = dup(STDIN_FILENO);
++
++    if(fd >= 0) {
++        return fd;
++    }
++    return -1;
+ }
+ 
+ int __wrap_setsockopt(UNUSED int socket, UNUSED int level, UNUSED int option_name, UNUSED const void* option_value, UNUSED socklen_t option_len) {
+diff --git a/test/mod-dhcpv4c_lease/test_lease.c b/test/mod-dhcpv4c_lease/test_lease.c
+index 02b3f29..28907ac 100644
+--- a/test/mod-dhcpv4c_lease/test_lease.c
++++ b/test/mod-dhcpv4c_lease/test_lease.c
+@@ -108,6 +108,7 @@ int test_setup(UNUSED void** state) {
+     amxm_module_t* mod = NULL;
+     assert_non_null(so);
+     assert_int_equal(amxm_module_register(&mod, so, MOD_CORE), 0);
++    assert_int_equal(register_event_loop_mock_handlers(mod), 0);
+     system("cp -p ../mocks/dhcpleases_backup ../mocks/dhcplease_eth0");
+     return 0;
+ }
+diff --git a/test/mod-dhcpv4c_packets/test_packets.c b/test/mod-dhcpv4c_packets/test_packets.c
+index 6888476..29ceb16 100644
+--- a/test/mod-dhcpv4c_packets/test_packets.c
++++ b/test/mod-dhcpv4c_packets/test_packets.c
+@@ -107,12 +107,10 @@ static int dm_update_client(UNUSED const char* function_name,
+                             UNUSED amxc_var_t* args,
+                             UNUSED amxc_var_t* ret) {
+ 
+-    dhcp_interface_t* intf = NULL;
+-
+-    intf = dhcp_interface_find(INTF_NAME);
++    amxc_var_t* params = GET_ARG(args, "parameters");
++    const char* status = GET_CHAR(params, "status");
+ 
+-    if(intf->lease->state == dhcp_client_state_bound) {
+-        amxc_var_t* params = GET_ARG(args, "parameters");
++    if((status != NULL) && (strcmp(status, "Bound") == 0)) {
+         assert_non_null(params);
+         // Check presence of parameters:
+         assert_non_null(GET_CHAR(params, "ifname"));
+@@ -146,6 +144,7 @@ int test_setup(UNUSED void** state) {
+     amxm_module_t* mod = NULL;
+     assert_non_null(so);
+     assert_int_equal(amxm_module_register(&mod, so, MOD_CORE), 0);
++    assert_int_equal(register_event_loop_mock_handlers(mod), 0);
+     assert_int_equal(start_stop_client(true, INTF_NAME), 0);
+     assert_int_equal(amxm_module_add_function(mod, "update-client", dm_update_client), 0);
+     return 0;
+@@ -189,6 +188,8 @@ void test_raw_sock_handler(UNUSED void** state) {
+     add_data_to_var(&data);
+     intf = dhcp_interface_find(INTF_NAME);
+ 
++    assert_non_null(intf);
++    assert_true(intf->dhcp_raw_sock >= 0);
+     intf->lease->xid = 1362016768;
+     intf->lease->state = dhcp_client_state_selecting;
+     intf->lease->check_authentication = false;
+diff --git a/test/mod-dhcpv4c_start_stop/test_start_stop.c b/test/mod-dhcpv4c_start_stop/test_start_stop.c
+index 76df5e4..39844f4 100644
+--- a/test/mod-dhcpv4c_start_stop/test_start_stop.c
++++ b/test/mod-dhcpv4c_start_stop/test_start_stop.c
+@@ -107,6 +107,7 @@ int test_setup(UNUSED void** state) {
+     amxm_module_t* mod = NULL;
+     assert_non_null(so);
+     assert_int_equal(amxm_module_register(&mod, so, MOD_CORE), 0);
++    assert_int_equal(register_event_loop_mock_handlers(mod), 0);
+     return 0;
+ }
+ 
+diff --git a/test/mod-dhcpv4c_stat/test_stat.c b/test/mod-dhcpv4c_stat/test_stat.c
+index 1fd499b..94a1b72 100644
+--- a/test/mod-dhcpv4c_stat/test_stat.c
++++ b/test/mod-dhcpv4c_stat/test_stat.c
+@@ -90,6 +90,7 @@
+ #include "dhcp_dm.h"
+ #include "dhcp_util.h"
+ #include "mock_socket.h"
++#include "common_functions.h"
+ #include "mod_dhcpv4c.h"
+ #include <amxm/amxm.h>
+ #include <amxut/amxut_bus.h>
+@@ -98,37 +99,12 @@
+ #include <errno.h>
+ #include <amxj/amxj_variant.h>
+ 
+-#define INTF_NAME               "eth0"
+-#define WRONG_INTF_NAME         "ethx"
+-
+-static int start_stop_client(bool start, const char* intf) {
+-    const char* func = start ? "dhcpv4c-start" : "dhcpv4c-stop";
+-    int retval = -1;
+-    amxc_var_t result;
+-    amxc_var_t data;
+-
+-    amxc_var_init(&result);
+-    amxc_var_init(&data);
+-
+-    amxc_var_set_type(&data, AMXC_VAR_ID_HTABLE);
+-    amxc_var_add_key(cstring_t, &data, "Interface", "Device.IP.Interface.2.");
+-    amxc_var_add_key(cstring_t, &data, "IfName", intf);
+-
+-    retval = amxm_execute_function(NULL, "mod-dhcpv4c", func, &data, &result);
+-    when_failed(retval, exit);
+-    retval = GET_INT32(&result, NULL);
+-exit:
+-
+-    amxc_var_clean(&result);
+-    amxc_var_clean(&data);
+-    return retval;
+-}
+-
+ int test_setup(UNUSED void** state) {
+     amxm_shared_object_t* so = amxm_get_so("self");
+     amxm_module_t* mod = NULL;
+     assert_non_null(so);
+     assert_int_equal(amxm_module_register(&mod, so, MOD_CORE), 0);
++    assert_int_equal(register_event_loop_mock_handlers(mod), 0);
+     assert_int_equal(start_stop_client(true, INTF_NAME), 0);
+     return 0;
+ }
+-- 
+2.51.0.windows.1
+

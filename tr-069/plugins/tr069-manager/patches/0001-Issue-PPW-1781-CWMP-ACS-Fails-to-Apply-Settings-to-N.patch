@@ -1,0 +1,96 @@
+From f4a1a992482db978b4bfaf57f2b3302687a67402 Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Tue, 7 Apr 2026 14:36:38 +0800
+Subject: [PATCH] Issue: PPW-1781 [CWMP] ACS Fails to Apply Settings to New
+ DHCPv4 Server Pool Until Reboot
+
+Problem:
+--------
+After creating a new `Device.DHCPv4.Server.Pool` instance via ACS, its
+parameters (e.g., Interface, Leasetime) cannot be set. Meanwhile,
+pre-existing `Device.DHCPv4.Server.Pool` instances can be updated without
+issues.
+
+The issue resolves only after rebooting the CPE.
+
+This behavior appears to be specific to `Device.DHCPv4.Server.Pool` and has
+not been observed on other nodes.
+
+Root Cause:
+-----------
+After adding a new `Device.DHCPv4.Server.Pool` via ACS, its parameters
+could not be set because the ACL wildcard (*) was removed during the first
+CWMP operation, and no ACL refresh occurred after `AddObject`. As a
+result, the newly added instance inherits the `Pool`'s ACL permissions,
+which do not grant write access to parameters. Existing instances work
+because concrete ACL rules already exist.
+
+Solution:
+---------
+ACL rules are refreshed from the JSON files after adding a new Pool
+instance, ensuring the SET permission is applied without requiring a CPE reboot.
+
+Closes: PPW-1781
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ .../amx/adapter/DM_AmxSystemConnection.c      | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/dmdeviceadapter/amx/adapter/DM_AmxSystemConnection.c b/src/dmdeviceadapter/amx/adapter/DM_AmxSystemConnection.c
+index 9880d64..fd9809d 100644
+--- a/src/dmdeviceadapter/amx/adapter/DM_AmxSystemConnection.c
++++ b/src/dmdeviceadapter/amx/adapter/DM_AmxSystemConnection.c
+@@ -94,6 +94,34 @@
+ 
+ // Subscription list
+ static amxc_llist_t systemSubsList;
++
++//---------------------------------------------------------------------------------------------
++/**
++   @brief
++   Handle a dm:instance-added event.
++
++   @details
++   When a new data model instance is added, the in-memory ACL cache becomes stale.
++   This callback refreshes the ACL rules so that subsequent ACS operations on the new instance are allowed.
++
++   @param path object path
++   @param data notification data
++*/
++static void DM_ENG_Device_SystemConnectionHandleInstanceAdded(UNUSED const char* path,
++                                                              UNUSED const amxc_var_t* const data) {
++    dm_amx_env_t* amx = DM_ENG_Device_GetACSInfo();
++    when_null(amx, stop);
++    when_null(amx->acl, stop);
++
++    SAH_TRACEZ_INFO("DM_DA", "Instance added on [%s], refreshing ACL rules", path);
++
++    amxc_var_delete(&amx->acl_rules);
++    amx->acl_rules = amxa_parse_files(amx->acl);
++
++stop:
++    return;
++}
++
+ //---------------------------------------------------------------------------------------------
+ /**
+    @brief
+@@ -843,6 +871,15 @@ bool DM_ENG_Device_SystemConnectionInitialize(dm_amx_env_t* amx, const char* bac
+         goto stop;
+     }
+ 
++    /* Subscribe to instance-added events to refresh ACL cache */
++    if(DM_ENG_Device_Common_AddSubscription(&systemSubsList, amx, "Device.",
++                                            "notification in ['dm:instance-added']",
++                                            &DM_ENG_Device_SystemConnectionHandleInstanceAdded,
++                                            &id) != 0) {
++        SAH_TRACEZ_ERROR("DM_DA", "Could not create instance-added notification");
++        goto stop;
++    }
++
+     if(DM_ENG_SetManagementServerValue(DM_ENG_EntityType_SYSTEM, DM_ENG_SESSIONSTATUS, "Idle") != 0) {
+         SAH_TRACEZ_ERROR("DM_DA", "Could not set Session Status in the datamodel");
+     }
+-- 
+2.51.0.windows.1
+

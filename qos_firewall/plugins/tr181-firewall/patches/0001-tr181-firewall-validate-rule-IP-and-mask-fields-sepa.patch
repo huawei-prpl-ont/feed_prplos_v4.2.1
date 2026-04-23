@@ -1,0 +1,1269 @@
+From c1c239d5352aebc5516ecf3759354aac4cfca3f6 Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Tue, 14 Apr 2026 14:37:55 +0800
+Subject: [PATCH] tr181-firewall: validate rule IP and mask fields separately
+ [PPW-1462]
+
+Problem: Current implementation treats SourceMask and DestMask as full IP
+addresses when applying firewall rules.
+
+According to TR-181:
+- SourceIP/DestIP must contain only host IP addresses
+- SourceMask/DestMask must be in IP prefix (CIDR) format
+
+The IP portion of the mask field should be ignored, and only the
+prefix length used for matching.
+
+Solution: Add dedicated validators for rule IP addresses and rule mask
+values. Update rule event handling to apply the configured mask to the
+current IP and push the resulting network/prefix to the firewall backend.
+
+Fixes: PPW-1462
+Reference: https://prplfoundation.atlassian.net/browse/PPW-1462
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ include_priv/ip_address.h            |   3 +
+ include_priv/validator.h             |  14 +
+ odl/firewall/firewall_definition.odl |   8 +-
+ src/firewall/dm_rule_events.c        |  67 +++-
+ src/gmap/gmap_query.c                |   4 +-
+ src/ip_address.c                     |  82 ++++-
+ src/rules.c                          |  27 +-
+ src/validator.c                      |  75 ++++-
+ test/mocks/dummy.c                   |   2 +
+ test/mocks/linux_mock.c              |   9 +
+ test/mocks/linux_mock.h              |   4 +
+ test/test_defines.mk                 |   2 +
+ test/test_fw_1/test_dm_chain.c       | 458 +++++++++++++++++++++------
+ test/test_fw_1/test_dm_chain.h       |   3 +
+ test/test_fw_1/test_dm_logs.c        |   6 +-
+ test/test_fw_1/test_main.c           |   3 +
+ 16 files changed, 651 insertions(+), 116 deletions(-)
+
+diff --git a/include_priv/ip_address.h b/include_priv/ip_address.h
+index 3dd9772..4eb2cf2 100644
+--- a/include_priv/ip_address.h
++++ b/include_priv/ip_address.h
+@@ -111,6 +111,9 @@ bool address_is_required(address_t* address);
+ bool require_address(bool require, address_t* address, required_reason_t reason);
+ const char* network_address(amxc_var_t* prefix);
+ const char* host_address(amxc_var_t* prefix);
++ipversion_t address_string_ipversion(const char* address);
++bool address_rule_ip_mask_compatible(const char* ip, const char* mask, ipversion_t rule_ipversion);
++bool address_parse_rule_mask_prefixlen(const char* mask, int* prefixlen);
+ 
+ #ifdef WITH_GMAP
+ bool address_add_device(address_t* address, const char* alias, amxc_var_t* device_params);
+diff --git a/include_priv/validator.h b/include_priv/validator.h
+index 24bccdd..706b990 100644
+--- a/include_priv/validator.h
++++ b/include_priv/validator.h
+@@ -99,6 +99,20 @@ amxd_status_t _fw_is_valid_ipv4_prefix(amxd_object_t* object,
+                                        amxc_var_t* const retval,
+                                        void* priv);
+ 
++amxd_status_t _fw_is_valid_rule_mask(amxd_object_t* object,
++                                     amxd_param_t* param,
++                                     amxd_action_t reason,
++                                     const amxc_var_t* const args,
++                                     amxc_var_t* const retval,
++                                     void* priv);
++
++amxd_status_t _fw_is_valid_ip_address(amxd_object_t* object,
++                                      amxd_param_t* param,
++                                      amxd_action_t reason,
++                                      const amxc_var_t* const args,
++                                      amxc_var_t* const retval,
++                                      void* priv);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/odl/firewall/firewall_definition.odl b/odl/firewall/firewall_definition.odl
+index bee05f5..0621d1d 100644
+--- a/odl/firewall/firewall_definition.odl
++++ b/odl/firewall/firewall_definition.odl
+@@ -418,7 +418,7 @@
+                  * @version 1.0
+                  */
+                 %persistent string DestIP {
+-                    on action validate call is_valid_ip;
++                    on action validate call fw_is_valid_ip_address;
+                     default "";
+                 }
+ 
+@@ -428,7 +428,7 @@
+                  */
+                 %persistent string DestMask {
+                     on action validate call check_maximum_length 49;
+-                    on action validate call fw_is_valid_prefix;
++                    on action validate call fw_is_valid_rule_mask;
+                     default "";
+                 }
+ 
+@@ -466,7 +466,7 @@
+                  * @version 1.0
+                  */
+                 %persistent string SourceIP {
+-                    on action validate call is_valid_ip;
++                    on action validate call fw_is_valid_ip_address;
+                     default "";
+                 }
+ 
+@@ -476,7 +476,7 @@
+                  */
+                 %persistent string SourceMask {
+                     on action validate call check_maximum_length 49;
+-                    on action validate call fw_is_valid_prefix;
++                    on action validate call fw_is_valid_rule_mask;
+                     default "";
+                 }
+ 
+diff --git a/src/firewall/dm_rule_events.c b/src/firewall/dm_rule_events.c
+index 0200f3b..5f32d7d 100644
+--- a/src/firewall/dm_rule_events.c
++++ b/src/firewall/dm_rule_events.c
+@@ -61,6 +61,7 @@
+ ****************************************************************************/
+ 
+ #include "firewall/dm_firewall.h"
++#include "ip_address.h"
+ #include "rules.h"
+ #include "usp_utils.h"
+ #include "ipset/dm_ipset.h"
+@@ -73,26 +74,78 @@
+ #include <debug/sahtrace.h>
+ #include <debug/sahtrace_macros.h>
+ #include <amxc/amxc_macros.h>
++#include <amxc/amxc_string.h>
+ #include <fwinterface/interface.h> // for fw_apply
++#include <ipat/ipat.h>
++#include <stdlib.h>
+ 
+ #define ME "firewall"
+ 
++static void apply_masked_ip(rule_t* rule,
++                            const char* param_mask,
++                            const char* mask,
++                            const char* param_ip,
++                            const char* ip,
++                            void (* apply_ip)(rule_t*, const char*)) {
++    amxc_string_t buf;
++    char* network = NULL;
++    int prefixlen = 0;
++
++    amxc_string_init(&buf, 0);
++
++    if(STRING_EMPTY(ip)) {
++        apply_ip(rule, "");
++        goto exit;
++    }
++
++    if(!address_rule_ip_mask_compatible(ip, mask, IPvAll)) {
++        apply_ip(rule, "");
++        goto exit;
++    }
++
++    when_false_trace(address_parse_rule_mask_prefixlen(mask, &prefixlen), exit, ERROR, "Failed to parse %s[%s]", param_mask, mask);
++
++    network = ipat_text_mask_apply_direct(ip, prefixlen, ipat_bits_upper, ipat_oper_and, false);
++    when_null_trace(network, exit, ERROR, "Failed to apply %s[%s] to %s[%s]", param_mask, mask, param_ip, ip);
++
++    amxc_string_setf(&buf, "%s/%d", network, prefixlen);
++    apply_ip(rule, amxc_string_get(&buf, 0));
++
++exit:
++    free(network);
++    amxc_string_clean(&buf);
++}
++
+ static void mask_or_ip_changed(bool changed_event, amxc_var_t* params, amxd_object_t* obj, const char* param_mask, const char* param_ip, void (* apply_ip)(rule_t*, const char*), rule_t* rule) {
+     amxc_var_t* var = NULL;
+     const char* ip = NULL;
++    const char* mask = NULL;
+     const char* to = changed_event ? "to" : NULL;
+ 
+     var = GET_ARG(params, param_mask);
+     if(var != NULL) {
+-        ip = GET_CHAR(var, to);
+-        if(!STRING_EMPTY(ip)) {
+-            apply_ip(rule, ip);
++        mask = GET_CHAR(var, to);
++        if(!STRING_EMPTY(mask)) {
++            var = GET_ARG(params, param_ip);
++            if(var != NULL) {
++                ip = GET_CHAR(var, to);
++            } else {
++                ip = object_da_string(obj, param_ip);
++            }
++            apply_masked_ip(rule, param_mask, mask, param_ip, ip, apply_ip);
+             goto exit;
+         }
+     } else {
+-        ip = object_da_string(obj, param_mask);
+-        if(!STRING_EMPTY(ip)) {
+-            goto exit; // already in use
++        mask = object_da_string(obj, param_mask);
++        if(!STRING_EMPTY(mask)) {
++            var = GET_ARG(params, param_ip);
++            if(var != NULL) {
++                ip = GET_CHAR(var, to);
++            } else {
++                ip = object_da_string(obj, param_ip);
++            }
++            apply_masked_ip(rule, param_mask, mask, param_ip, ip, apply_ip);
++            goto exit;
+         }
+     }
+ 
+@@ -448,4 +501,4 @@ int rule_log_update_cb(UNUSED amxd_object_t* templ, amxd_object_t* object, void*
+ exit:
+     FW_PROFILING_OUT();
+     return amxd_status_ok;
+-}
+\ No newline at end of file
++}
+diff --git a/src/gmap/gmap_query.c b/src/gmap/gmap_query.c
+index 2bdc558..7b70b81 100644
+--- a/src/gmap/gmap_query.c
++++ b/src/gmap/gmap_query.c
+@@ -336,6 +336,8 @@ exit:
+ 
+ void fwgmap_cleanup(void) {
+     amxc_llist_clean(&waiting_list_rules, NULL);
++    amxp_timer_delete(&timer_retry_start);
++    fwgmap_state = FWGMAP_UNINITIALIZED;
+ }
+ 
+ int query_hostname_address(rule_t* rule, const char* address) {
+@@ -605,4 +607,4 @@ bool rule_query_dest_address_by_mac(rule_t* rule, const char* mac) {
+ 
+ exit:
+     return rv == 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/ip_address.c b/src/ip_address.c
+index ff41911..779e03d 100644
+--- a/src/ip_address.c
++++ b/src/ip_address.c
+@@ -67,6 +67,7 @@
+ #include <debug/sahtrace.h>
+ #include <debug/sahtrace_macros.h>
+ #include <ipat/ipat.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #define ME "firewall"
+@@ -94,6 +95,85 @@ ipversion_t int_to_ipversion(int value) {
+     return version;
+ }
+ 
++ipversion_t address_string_ipversion(const char* address) {
++    ipversion_t version = IPvUnknown;
++    ipat_t ip = IPAT_INITIALIZE;
++
++    if(STRING_EMPTY(address)) {
++        return IPvAll;
++    }
++
++    if(!ipat_pton(&ip, AF_INET_ANY, address) || !ipat_valid(&ip)) {
++        return IPvUnknown;
++    }
++
++    version = (ipat_family(&ip) == AF_INET) ? IPv4 : IPv6;
++    return version;
++}
++
++bool address_parse_rule_mask_prefixlen(const char* mask, int* prefixlen) {
++    bool valid = false;
++    char* endptr = NULL;
++
++    when_str_empty(mask, exit);
++    when_null(prefixlen, exit);
++
++    if(mask[0] == '/') {
++        long parsed = 0;
++
++        when_true(mask[1] == '\0', exit);
++        parsed = strtol(mask + 1, &endptr, 10);
++        when_false((endptr != NULL) && (*endptr == '\0'), exit);
++        when_false((parsed >= 0) && (parsed <= 128), exit);
++        *prefixlen = (int) parsed;
++        valid = true;
++        goto exit;
++    }
++
++    if(strchr(mask, '/') != NULL) {
++        ipat_t prefix = IPAT_INITIALIZE;
++
++        when_false(ipat_pton(&prefix, AF_INET_ANY, mask), exit);
++        *prefixlen = ipat_prefix_length(&prefix);
++        valid = ipat_valid(&prefix);
++    }
++
++exit:
++    return valid;
++}
++
++bool address_rule_ip_mask_compatible(const char* ip, const char* mask, ipversion_t rule_ipversion) {
++    ipversion_t ipversion = IPvAll;
++    int prefixlen = 0;
++
++    if(STRING_EMPTY(ip)) {
++        return STRING_EMPTY(mask);
++    }
++
++    ipversion = address_string_ipversion(ip);
++    if(ipversion == IPvUnknown) {
++        return false;
++    }
++
++    if((rule_ipversion > IPvAll) && (ipversion != rule_ipversion)) {
++        return false;
++    }
++
++    if(STRING_EMPTY(mask)) {
++        return true;
++    }
++
++    if(!address_parse_rule_mask_prefixlen(mask, &prefixlen)) {
++        return false;
++    }
++
++    if((ipversion == IPv4) && (prefixlen > 32)) {
++        return false;
++    }
++
++    return true;
++}
++
+ static void address_clean_list(amxc_var_t* ip_list, size_t* count) {
+     size_t num_of_addresses = 0;
+ 
+@@ -391,4 +471,4 @@ bool address_add_device(address_t* address, const char* alias, amxc_var_t* devic
+ out:
+     return rv;
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/rules.c b/src/rules.c
+index f2d4c4a..8cb9d2d 100644
+--- a/src/rules.c
++++ b/src/rules.c
+@@ -1212,6 +1212,29 @@ exit:
+ 
+ }
+ 
++static bool rule_check_ip_and_mask(rule_t* rule, const char* ip_param, const char* mask_param) {
++    amxd_object_t* object = rule->common.object;
++    const char* ip = object_da_string(object, ip_param);
++    const char* mask = object_da_string(object, mask_param);
++    ipversion_t rule_ipversion = object_get_ipversion(object);
++    void (* clear_address)(rule_t*, const char*) = (strcmp(ip_param, "SourceIP") == 0) ? rule_set_source : rule_set_destination;
++
++    if(address_rule_ip_mask_compatible(ip, mask, rule_ipversion)) {
++        return true;
++    }
++
++    clear_address(rule, "");
++    SAH_TRACEZ_ERROR(ME,
++                     "Rule[%s] misconf because %s[%s], %s[%s] and IPVersion[%d] are not compatible",
++                     OBJECT_NAMED,
++                     ip_param,
++                     ip,
++                     mask_param,
++                     mask,
++                     rule_ipversion);
++    return false;
++}
++
+ static bool rule_check_datamodel(rule_t* rule) {
+     amxd_object_t* object = rule->common.object;
+     char* src_set = NULL;
+@@ -1239,6 +1262,8 @@ static bool rule_check_datamodel(rule_t* rule) {
+ 
+         when_true_trace(!STRING_EMPTY(src_set) && !STRING_EMPTY(src_set_exclude), out, ERROR, "Rule[%s] misconf because SourceMatchSet and SourceMatchSetExclude are both defined", OBJECT_NAMED);
+         when_true_trace(!STRING_EMPTY(dest_set) && !STRING_EMPTY(dest_set_exclude), out, ERROR, "Rule[%s] misconf because DestMatchSet and DestMatchSetExclude are both defined", OBJECT_NAMED);
++        when_false_trace(rule_check_ip_and_mask(rule, "SourceIP", "SourceMask"), out, ERROR, "Rule[%s] misconf because SourceIP and SourceMask are inconsistent", OBJECT_NAMED);
++        when_false_trace(rule_check_ip_and_mask(rule, "DestIP", "DestMask"), out, ERROR, "Rule[%s] misconf because DestIP and DestMask are inconsistent", OBJECT_NAMED);
+         when_false_trace(rule_check_datamodel_set_path(rule, src_set), out, ERROR, "Rule[%s] misconf because SourceMatchSet is invalid", OBJECT_NAMED);
+         when_false_trace(rule_check_datamodel_set_path(rule, src_set_exclude), out, ERROR, "Rule[%s] misconf because SourceMatchSetExclude is invalid", OBJECT_NAMED);
+         when_false_trace(rule_check_datamodel_set_path(rule, dest_set), out, ERROR, "Rule[%s] misconf because DestMatchSet is invalid", OBJECT_NAMED);
+@@ -1888,4 +1913,4 @@ bool reorder_chain_rules(rule_t* rule) {
+     ret_value = true;
+ out:
+     return ret_value;
+-}
+\ No newline at end of file
++}
+diff --git a/src/validator.c b/src/validator.c
+index 3575d17..5a631af 100644
+--- a/src/validator.c
++++ b/src/validator.c
+@@ -62,7 +62,10 @@
+ 
+ #include "validator.h"
+ #include "firewall.h" // for fw_get_dm
++#include "firewall_utilities.h"
++#include "ip_address.h"
+ #include "profiling/profiling.h"
++#include <string.h>
+ #include <debug/sahtrace.h>
+ #include <debug/sahtrace_macros.h>
+ #include <amxc/amxc_macros.h>
+@@ -164,6 +167,32 @@ exit:
+     return valid;
+ }
+ 
++static bool valid_rule_mask(const amxc_var_t* const args) {
++    int prefixlen = 0;
++    const char* mask = GET_CHAR(args, NULL);
++
++    if(STRING_EMPTY(mask)) {
++        return true;
++    }
++
++    return address_parse_rule_mask_prefixlen(mask, &prefixlen);
++}
++
++static bool valid_ip_address(const amxc_var_t* const args) {
++    ipat_t ip = IPAT_INITIALIZE;
++    const char* ip_address = GET_CHAR(args, NULL);
++
++    if(STRING_EMPTY(ip_address)) {
++        return true;
++    }
++
++    if(strchr(ip_address, '/') != NULL) {
++        return false;
++    }
++
++    return ipat_pton(&ip, AF_INET_ANY, ip_address) && ipat_valid(&ip);
++}
++
+ amxd_status_t _fw_is_valid_prefix(UNUSED amxd_object_t* object,
+                                   UNUSED amxd_param_t* param,
+                                   amxd_action_t reason,
+@@ -206,4 +235,48 @@ amxd_status_t _fw_is_valid_ipv4_prefix(UNUSED amxd_object_t* object,
+ exit:
+     FW_PROFILING_OUT();
+     return status;
+-}
+\ No newline at end of file
++}
++
++amxd_status_t _fw_is_valid_rule_mask(UNUSED amxd_object_t* object,
++                                     UNUSED amxd_param_t* param,
++                                     amxd_action_t reason,
++                                     const amxc_var_t* const args,
++                                     UNUSED amxc_var_t* const retval,
++                                     UNUSED void* priv) {
++    FW_PROFILING_IN(TRACE_DM_ACTION);
++    amxd_status_t status = amxd_status_unknown_error;
++
++    when_true_status(reason != action_param_validate,
++                     exit,
++                     status = amxd_status_function_not_implemented);
++
++    when_false_status(valid_rule_mask(args), exit, status = amxd_status_invalid_arg);
++
++    status = amxd_status_ok;
++
++exit:
++    FW_PROFILING_OUT();
++    return status;
++}
++
++amxd_status_t _fw_is_valid_ip_address(UNUSED amxd_object_t* object,
++                                      UNUSED amxd_param_t* param,
++                                      amxd_action_t reason,
++                                      const amxc_var_t* const args,
++                                      UNUSED amxc_var_t* const retval,
++                                      UNUSED void* priv) {
++    FW_PROFILING_IN(TRACE_DM_ACTION);
++    amxd_status_t status = amxd_status_unknown_error;
++
++    when_true_status(reason != action_param_validate,
++                     exit,
++                     status = amxd_status_function_not_implemented);
++
++    when_false_status(valid_ip_address(args), exit, status = amxd_status_invalid_arg);
++
++    status = amxd_status_ok;
++
++exit:
++    FW_PROFILING_OUT();
++    return status;
++}
+diff --git a/test/mocks/dummy.c b/test/mocks/dummy.c
+index 22b37ac..18f607f 100644
+--- a/test/mocks/dummy.c
++++ b/test/mocks/dummy.c
+@@ -239,6 +239,8 @@ static void resolve_functions(amxo_parser_t* parser) {
+     //validators
+     amxo_resolver_ftab_add(parser, "fw_is_valid_prefix", AMXO_FUNC(_fw_is_valid_prefix));
+     amxo_resolver_ftab_add(parser, "fw_is_valid_ipv4_prefix", AMXO_FUNC(_fw_is_valid_ipv4_prefix));
++    amxo_resolver_ftab_add(parser, "fw_is_valid_rule_mask", AMXO_FUNC(_fw_is_valid_rule_mask));
++    amxo_resolver_ftab_add(parser, "fw_is_valid_ip_address", AMXO_FUNC(_fw_is_valid_ip_address));
+ }
+ 
+ static setup_teardown_hooks_t default_hooks;
+diff --git a/test/mocks/linux_mock.c b/test/mocks/linux_mock.c
+index 7b6207c..83a1e34 100644
+--- a/test/mocks/linux_mock.c
++++ b/test/mocks/linux_mock.c
+@@ -70,6 +70,7 @@
+ 
+ #include "mock.h"
+ #include "linux_mock.h"
++#include "kmods.h"
+ 
+ static struct protoent dummy;
+ 
+@@ -103,3 +104,11 @@ struct protoent* getprotobyname(const char* name) {
+ exit:
+     return (dummy.p_proto != 0) ? &dummy : NULL;
+ }
++
++int __wrap_fw_load_kernel_module(UNUSED const char* module_name, UNUSED const char* options) {
++    return 0;
++}
++
++int __wrap_fw_unload_kernel_module(UNUSED const char* module_name, UNUSED bool check_result) {
++    return 0;
++}
+diff --git a/test/mocks/linux_mock.h b/test/mocks/linux_mock.h
+index ba00c86..d65e3eb 100644
+--- a/test/mocks/linux_mock.h
++++ b/test/mocks/linux_mock.h
+@@ -63,6 +63,10 @@
+ #ifndef __TEST_LINUX_MOCK_H__
+ #define __TEST_LINUX_MOCK_H__
+ 
++#include <stdbool.h>
++
+ struct protoent* getprotobynumber(int proto);
++int __wrap_fw_load_kernel_module(const char* module_name, const char* options);
++int __wrap_fw_unload_kernel_module(const char* module_name, bool check_result);
+ 
+ #endif
+diff --git a/test/test_defines.mk b/test/test_defines.mk
+index 2a87919..66e047c 100644
+--- a/test/test_defines.mk
++++ b/test/test_defines.mk
+@@ -27,6 +27,8 @@ MOCK_WRAP = netmodel_openQuery_getAddrs \
+ 			netmodel_closeQuery \
+ 			netmodel_luckyIntf \
+ 			fw_commit \
++			fw_load_kernel_module \
++			fw_unload_kernel_module \
+ 			amxp_subproc_vstart \
+ 			amxp_subproc_wait \
+ 			amxp_subproc_get_exitstatus \
+diff --git a/test/test_fw_1/test_dm_chain.c b/test/test_fw_1/test_dm_chain.c
+index 12f756a..08e5a97 100644
+--- a/test/test_fw_1/test_dm_chain.c
++++ b/test/test_fw_1/test_dm_chain.c
+@@ -155,16 +155,12 @@ static void a_populate_filter_rule_log(fw_rule_t* rule) {
+     assert_int_equal(fw_rule_set_chain(rule, "FORWARD_L_Low"), 0);
+     assert_int_equal(fw_rule_set_ipv4(rule, true), 0);
+     assert_int_equal(fw_rule_set_protocol(rule, 6), 0);
+-    assert_int_equal(fw_rule_set_source(rule, "10.0.0.1/32"), 0);
+-    assert_int_equal(fw_rule_set_source_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_source_port(rule, 7000), 0);
+     assert_int_equal(fw_rule_set_source_port_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_in_interface(rule, "eth0"), 0);
+     assert_int_equal(fw_rule_set_in_interface_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_out_interface(rule, "br-lan"), 0);
+     assert_int_equal(fw_rule_set_out_interface_excluded(rule, true), 0);
+-    assert_int_equal(fw_rule_set_destination(rule, "192.168.1.0/24"), 0);
+-    assert_int_equal(fw_rule_set_destination_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_destination_port(rule, 8000), 0);
+     assert_int_equal(fw_rule_set_destination_port_range_max(rule, 8001), 0);
+     assert_int_equal(fw_rule_set_destination_port_excluded(rule, true), 0);
+@@ -180,16 +176,12 @@ static void a_populate_filter_rule(fw_rule_t* rule) {
+     assert_int_equal(fw_rule_set_chain(rule, "FORWARD_L_Low"), 0);
+     assert_int_equal(fw_rule_set_ipv4(rule, true), 0);
+     assert_int_equal(fw_rule_set_protocol(rule, 6), 0);
+-    assert_int_equal(fw_rule_set_source(rule, "10.0.0.1/32"), 0);
+-    assert_int_equal(fw_rule_set_source_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_source_port(rule, 7000), 0);
+     assert_int_equal(fw_rule_set_source_port_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_in_interface(rule, "eth0"), 0);
+     assert_int_equal(fw_rule_set_in_interface_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_out_interface(rule, "br-lan"), 0);
+     assert_int_equal(fw_rule_set_out_interface_excluded(rule, true), 0);
+-    assert_int_equal(fw_rule_set_destination(rule, "192.168.1.0/24"), 0);
+-    assert_int_equal(fw_rule_set_destination_excluded(rule, true), 0);
+     assert_int_equal(fw_rule_set_destination_port(rule, 8000), 0);
+     assert_int_equal(fw_rule_set_destination_port_range_max(rule, 8001), 0);
+     assert_int_equal(fw_rule_set_destination_port_excluded(rule, true), 0);
+@@ -244,6 +236,22 @@ static void b_populate_filter_rule(fw_rule_t* rule) {
+     assert_int_equal(fw_rule_set_enabled(rule, true), 0);
+ }
+ 
++static void a_populate_filter_rule_log_with_addresses(fw_rule_t* rule) {
++    a_populate_filter_rule_log(rule);
++    assert_int_equal(fw_rule_set_source(rule, "10.0.0.1/32"), 0);
++    assert_int_equal(fw_rule_set_source_excluded(rule, true), 0);
++    assert_int_equal(fw_rule_set_destination(rule, "192.168.1.0/24"), 0);
++    assert_int_equal(fw_rule_set_destination_excluded(rule, true), 0);
++}
++
++static void a_populate_filter_rule_with_addresses(fw_rule_t* rule) {
++    a_populate_filter_rule(rule);
++    assert_int_equal(fw_rule_set_source(rule, "10.0.0.1/32"), 0);
++    assert_int_equal(fw_rule_set_source_excluded(rule, true), 0);
++    assert_int_equal(fw_rule_set_destination(rule, "192.168.1.0/24"), 0);
++    assert_int_equal(fw_rule_set_destination_excluded(rule, true), 0);
++}
++
+ static void c_populate_filter_rule_log_denied_inbound(fw_rule_t* rule) {
+     assert_int_equal(fw_rule_set_table(rule, TEST_TABLE_FILTER), 0);
+     assert_int_equal(fw_rule_set_chain(rule, "FORWARD_L_Low"), 0);
+@@ -392,12 +400,14 @@ void test_chain_status(UNUSED void** state) {
+     assert_non_null(instance);
+     amxd_trans_select_object(&trans, instance);
+     amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.1.2");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.1.0/24");
+     amxd_trans_set_value(bool, &trans, "DestIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "DestPort", 8000);
+     amxd_trans_set_value(int32_t, &trans, "DestPortRangeMax", 8001);
+     amxd_trans_set_value(bool, &trans, "DestPortExclude", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1/32");
+     amxd_trans_set_value(bool, &trans, "SourceIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "SourcePort", 7000);
+     amxd_trans_set_value(bool, &trans, "SourcePortExclude", true);
+@@ -424,8 +434,8 @@ void test_chain_status(UNUSED void** state) {
+     amxd_trans_set_value(bool, &trans, "Enable", true);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+ 
+-    expect_fw_replace_rule(a_populate_filter_rule_log, 1);
+-    expect_fw_replace_rule(a_populate_filter_rule, 2);
++    expect_fw_replace_rule(a_populate_filter_rule_log_with_addresses, 1);
++    expect_fw_replace_rule(a_populate_filter_rule_with_addresses, 2);
+ 
+     handle_events();
+ 
+@@ -438,8 +448,8 @@ void test_chain_status(UNUSED void** state) {
+     amxd_trans_set_value(bool, &trans, "Enable", false);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+ 
+-    expect_fw_delete_rule(a_populate_filter_rule_log, 1);
+-    expect_fw_delete_rule(a_populate_filter_rule, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_log_with_addresses, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_with_addresses, 1);
+ 
+     handle_events();
+ 
+@@ -505,9 +515,9 @@ void test_rule_ip_or_mask(UNUSED void** state) {
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
+     amxd_trans_add_inst(&trans, 0, "rule-99");
+     amxd_trans_set_value(bool, &trans, "Enable", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.1.2/32");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.1.2");
+     amxd_trans_set_value(cstring_t, &trans, "SourceMask", "192.168.1.0/24");
+-    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.2.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.2.1");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.2.0/24");
+     amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
+     amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
+@@ -520,31 +530,48 @@ void test_rule_ip_or_mask(UNUSED void** state) {
+     handle_events();
+ 
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+-    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.10.10.10");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/24");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "172.16.5.6");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/24");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", "192.168.2.0/24"), 1);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", "192.168.2.0/24"), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", "192.168.2.0/24"), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", "192.168.2.0/24"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.2/32", "192.168.2.0/24"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.2/32", "192.168.2.0/24"), 2);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.2/32", "192.168.2.0/24"), 3);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.2/32", "192.168.2.0/24"), 4);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 4);
++    handle_events();
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("10.10.10.10/32", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("10.10.10.10/32", "172.16.5.0/24"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("10.10.10.10/32", "172.16.5.0/24"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("10.10.10.10/32", "172.16.5.0/24"), 4);
+     handle_events();
+ 
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.2/32", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.2/32", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.2/32", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.2/32", "192.168.2.0/24"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.2/32", "192.168.2.1/32"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.2/32", "192.168.2.1/32"), 2);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.2/32", "192.168.2.1/32"), 3);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.2/32", "192.168.2.1/32"), 4);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("10.10.10.10/32", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("10.10.10.10/32", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("10.10.10.10/32", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("10.10.10.10/32", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("10.10.10.10/32", "172.16.5.6/32"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("10.10.10.10/32", "172.16.5.6/32"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("10.10.10.10/32", "172.16.5.6/32"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("10.10.10.10/32", "172.16.5.6/32"), 4);
+     handle_events();
+ 
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+@@ -552,22 +579,262 @@ void test_rule_ip_or_mask(UNUSED void** state) {
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.2.0/24");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.2/32", "192.168.2.1/32"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.2/32", "192.168.2.1/32"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.2/32", "192.168.2.1/32"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.2/32", "192.168.2.1/32"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", "192.168.2.0/24"), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", "192.168.2.0/24"), 2);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.0/24", "192.168.2.0/24"), 3);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.0/24", "192.168.2.0/24"), 4);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("10.10.10.10/32", "172.16.5.6/32"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("10.10.10.10/32", "172.16.5.6/32"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("10.10.10.10/32", "172.16.5.6/32"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("10.10.10.10/32", "172.16.5.6/32"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 4);
+     handle_events();
+ 
++    // When SourceIP/DestIP are empty while mask is non-empty, the backend
++    // must clear the old address match and the rule becomes misconfigured.
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/24");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/24");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 1);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Error_Misconfigured");
++
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
+     amxd_trans_del_inst(&trans, 0, "rule-99");
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", "192.168.2.0/24"), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", "192.168.2.0/24"), 1);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    handle_events();
++}
++
++void test_rule_ip_validation(UNUSED void** state) {
++    amxd_trans_t trans;
++
++    amxd_trans_init(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-ip-invalid-src-v4");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.0.0.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-ip-invalid-dst-v4");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "10.0.0.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-ip-invalid-src-v6");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "2001:db8::1/64");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 6);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-ip-invalid-dst-v6");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "2001:db8::1/64");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 6);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++}
++
++void test_rule_mask_validation(UNUSED void** state) {
++    amxd_trans_t trans;
++    amxd_object_t* instance = NULL;
++    amxc_var_t params;
++
++    amxd_trans_init(&trans);
++    amxc_var_init(&params);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-mask-invalid-src");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-mask-invalid-dst");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_not_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-mask-ipv6-prefix-only");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "2001:db8::1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "192.168.1.0/24");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "2001:db8::2");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "2001:db8::/24");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 6);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("2001:d00::/24", "2001:d00::/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("2001:d00::/24", "2001:d00::/24"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("2001:d00::/24", "2001:d00::/24"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("2001:d00::/24", "2001:d00::/24"), 4);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-mask-ipv6-prefix-only", "Status", "Enabled");
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
++    amxd_trans_del_inst(&trans, 0, "rule-mask-ipv6-prefix-only");
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("2001:d00::/24", "2001:d00::/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("2001:d00::/24", "2001:d00::/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("2001:d00::/24", "2001:d00::/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("2001:d00::/24", "2001:d00::/24"), 1);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    handle_events();
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-mask-ipv6");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "2001:db8::1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "2001:db8::2");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 6);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("2001:db8::/64", "2001:db8::/64"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("2001:db8::/64", "2001:db8::/64"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("2001:db8::/64", "2001:db8::/64"), 4);
++    handle_events();
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-mask-ipv6");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("2001:db8::1/128", "2001:db8::2/128"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("2001:db8::1/128", "2001:db8::2/128"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("2001:db8::1/128", "2001:db8::2/128"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("2001:db8::1/128", "2001:db8::2/128"), 4);
++    handle_events();
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
++    amxd_trans_del_inst(&trans, 0, "rule-mask-ipv6");
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("2001:db8::1/128", "2001:db8::2/128"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("2001:db8::1/128", "2001:db8::2/128"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("2001:db8::1/128", "2001:db8::2/128"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("2001:db8::1/128", "2001:db8::2/128"), 1);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    handle_events();
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-mask-v6-prefix-on-ipv4");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.10.10.10");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "172.16.5.6");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-mask-v6-prefix-on-ipv4", "Status", "Error_Misconfigured");
++
++    instance = amxd_dm_findf(dm, "Firewall.Chain.1.Rule.rule-mask-v6-prefix-on-ipv4");
++    assert_non_null(instance);
++    assert_int_equal(amxd_object_get_params(instance, &params, amxd_dm_access_protected), 0);
++    assert_string_equal(GET_CHAR(&params, "SourceIP"), "10.10.10.10");
++    assert_string_equal(GET_CHAR(&params, "SourceMask"), "/64");
++    assert_string_equal(GET_CHAR(&params, "DestIP"), "172.16.5.6");
++    assert_string_equal(GET_CHAR(&params, "DestMask"), "/64");
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
++    amxd_trans_del_inst(&trans, 0, "rule-mask-v6-prefix-on-ipv4");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    handle_events();
++
++    amxc_var_clean(&params);
++}
++
++void test_rule_ip_mask_family_transition(UNUSED void** state) {
++    amxd_trans_t trans;
++
++    amxd_trans_init(&trans);
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
++    amxd_trans_add_inst(&trans, 0, "rule-family-switch");
++    amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "2001:db8::1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "2001:db8::2");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/64");
++    amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 6);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("2001:db8::/64", "2001:db8::/64"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("2001:db8::/64", "2001:db8::/64"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("2001:db8::/64", "2001:db8::/64"), 4);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-family-switch", "Status", "Enabled");
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-family-switch");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.10.10.10");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "172.16.5.6");
++    amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("2001:db8::/64", "2001:db8::/64"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("2001:db8::/64", "2001:db8::/64"), 1);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-family-switch", "Status", "Error_Misconfigured");
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-family-switch");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/24");
++    amxd_trans_set_value(cstring_t, &trans, "DestMask", "/24");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 4);
++    handle_events();
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-family-switch", "Status", "Enabled");
++
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
++    amxd_trans_del_inst(&trans, 0, "rule-family-switch");
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("10.10.10.0/24", "172.16.5.0/24"), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("10.10.10.0/24", "172.16.5.0/24"), 1);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+     handle_events();
+@@ -585,9 +852,9 @@ void test_rule_change_order(UNUSED void** state) {
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
+     amxd_trans_add_inst(&trans, 0, "rule-99");
+     amxd_trans_set_value(bool, &trans, "Enable", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.1.2/32");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.1.2");
+     amxd_trans_set_value(cstring_t, &trans, "SourceMask", "192.168.1.0/24");
+-    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.2.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.2.1");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.2.0/24");
+     amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
+     amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
+@@ -602,9 +869,9 @@ void test_rule_change_order(UNUSED void** state) {
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule");
+     amxd_trans_add_inst(&trans, 0, "rule-99-2");
+     amxd_trans_set_value(bool, &trans, "Enable", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.3.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "192.168.3.1");
+     amxd_trans_set_value(cstring_t, &trans, "SourceMask", "192.168.3.0/24");
+-    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.4.1/32");
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.4.1");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.4.0/24");
+     amxd_trans_set_value(cstring_t, &trans, "Target", "Accept");
+     amxd_trans_set_value(int32_t, &trans, "IPVersion", 4);
+@@ -690,12 +957,14 @@ void test_chain_add_log_rule(UNUSED void** state) {
+     assert_non_null(instance);
+     amxd_trans_select_object(&trans, instance);
+     amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.1.2");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.1.0/24");
+     amxd_trans_set_value(bool, &trans, "DestIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "DestPort", 8000);
+     amxd_trans_set_value(int32_t, &trans, "DestPortRangeMax", 8001);
+     amxd_trans_set_value(bool, &trans, "DestPortExclude", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1/32");
+     amxd_trans_set_value(bool, &trans, "SourceIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "SourcePort", 7000);
+     amxd_trans_set_value(bool, &trans, "SourcePortExclude", true);
+@@ -711,9 +980,9 @@ void test_chain_add_log_rule(UNUSED void** state) {
+     amxd_trans_set_value(cstring_t, &trans, "Target", "X_PRPLWARE-COM_Log");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+ 
+-    expect_fw_replace_rule(a_populate_filter_rule_log, 1);
+-    expect_fw_delete_rule(a_populate_filter_rule_log, 1);
+-    expect_fw_replace_rule(a_populate_filter_rule_log, 1);
++    expect_fw_replace_rule(a_populate_filter_rule_log_with_addresses, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_log_with_addresses, 1);
++    expect_fw_replace_rule(a_populate_filter_rule_log_with_addresses, 1);
+     handle_events();
+ 
+     assert_int_equal(amxd_object_get_params(instance, &params, amxd_dm_access_protected), 0);
+@@ -730,10 +999,10 @@ void test_chain_add_log_rule(UNUSED void** state) {
+     amxd_trans_set_value(cstring_t, &trans, "Target", "Drop");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+ 
+-    expect_fw_delete_rule(a_populate_filter_rule_log, 1);
+-    expect_fw_replace_rule(a_populate_filter_rule, 1);
+-    expect_fw_delete_rule(a_populate_filter_rule, 1);
+-    expect_fw_replace_rule(a_populate_filter_rule, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_log_with_addresses, 1);
++    expect_fw_replace_rule(a_populate_filter_rule_with_addresses, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_with_addresses, 1);
++    expect_fw_replace_rule(a_populate_filter_rule_with_addresses, 1);
+     handle_events();
+ 
+     assert_int_equal(amxd_object_get_params(instance, &params, amxd_dm_access_protected), 0);
+@@ -746,7 +1015,7 @@ void test_chain_add_log_rule(UNUSED void** state) {
+     amxd_trans_set_value(bool, &trans, "Enable", false);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+ 
+-    expect_fw_delete_rule(a_populate_filter_rule, 1);
++    expect_fw_delete_rule(a_populate_filter_rule_with_addresses, 1);
+     handle_events();
+ 
+     assert_int_equal(amxd_object_get_params(instance, &params, amxd_dm_access_protected), 0);
+@@ -1274,51 +1543,50 @@ void test_rule_vendorclassid_and_source(UNUSED void** state) {
+     handle_events();
+     amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Enabled");
+ 
++    // ipv4 address change
++    amxc_var_set(jstring_t, &device_params, "{\"Alias\":\"device-99\",\"IPv4Address\":[{\"Address\":\"192.168.1.51\"}],\"IPv6Address\":[]}");
++    assert_int_equal(amxc_var_cast(&device_params, AMXC_VAR_ID_HTABLE), 0);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.51/32", NULL), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.51/32", NULL), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.51/32", NULL), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.51/32", NULL), 4);
++    query->fn(query, "device-99", &device_params, gmap_query_device_updated);
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Enabled");
++
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+-    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "192.168.1.0/24");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "/24");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 2);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 3);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 4);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.51/32", NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.51/32", NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.51/32", NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.51/32", NULL), 1);
+     handle_events();
+-    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Enabled");
++    amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Error_Misconfigured");
+ 
+-    // ipv4 address change
+-    amxc_var_set(jstring_t, &device_params, "{\"Alias\":\"device-99\",\"IPv4Address\":[{\"Address\":\"192.168.1.51\"}],\"IPv6Address\":[]}");
+-    assert_int_equal(amxc_var_cast(&device_params, AMXC_VAR_ID_HTABLE), 0);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.51/32", NULL), 2);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 3);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.51/32", NULL), 4);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 5);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.51/32", NULL), 6);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 7);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.51/32", NULL), 8);
+-    query->fn(query, "device-99", &device_params, gmap_query_device_updated);
++    amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "");
++    assert_int_equal(amxd_trans_apply(&trans, dm), 0);
++    amxd_trans_clean(&trans);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.51/32", NULL), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.51/32", NULL), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.51/32", NULL), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.51/32", NULL), 4);
++    handle_events();
+     amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Enabled");
+ 
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+     amxd_trans_set_value(cstring_t, &trans, "X_PRPLWARE-COM_VendorClassID", "");
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.51/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.51/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.51/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.51/32", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 2);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 3);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 4);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound(NULL, NULL), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound(NULL, NULL), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log(NULL, NULL), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule(NULL, NULL), 4);
+     handle_events();
+     amxut_dm_param_equals(cstring_t, "Firewall.Chain.1.Rule.rule-99", "Status", "Enabled");
+     query = NULL;
+@@ -1326,18 +1594,14 @@ void test_rule_vendorclassid_and_source(UNUSED void** state) {
+     expect_gmap_open_query_ext("{\"Alias\":\"device-99\",\"IPv4Address\":[{\"Address\":\"192.168.1.50\"}],\"IPv6Address\":[{\"Address\":\"fe80::50\"}]}");
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.rule-99");
+     amxd_trans_set_value(cstring_t, &trans, "X_PRPLWARE-COM_VendorClassID", "IP-STB");
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.50/32", NULL), 2);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 3);
+-    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.50/32", NULL), 4);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 5);
+-    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.50/32", NULL), 6);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 7);
+-    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.50/32", NULL), 8);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound(NULL, NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound(NULL, NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule_log(NULL, NULL), 1);
++    expect_fw_delete_rule_json(jstring_filter_rule(NULL, NULL), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_inbound("192.168.1.50/32", NULL), 1);
++    expect_fw_replace_rule_json(jstring_filter_log_allow_outbound("192.168.1.50/32", NULL), 2);
++    expect_fw_replace_rule_json(jstring_filter_rule_log("192.168.1.50/32", NULL), 3);
++    expect_fw_replace_rule_json(jstring_filter_rule("192.168.1.50/32", NULL), 4);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+     handle_events();
+@@ -1345,13 +1609,9 @@ void test_rule_vendorclassid_and_source(UNUSED void** state) {
+ 
+     amxd_trans_select_pathf(&trans, "Firewall.Chain.1.Rule.");
+     amxd_trans_del_inst(&trans, 0, "rule-99");
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_inbound("192.168.1.50/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_log_allow_outbound("192.168.1.50/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule_log("192.168.1.50/32", NULL), 1);
+-    expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.0/24", NULL), 1);
+     expect_fw_delete_rule_json(jstring_filter_rule("192.168.1.50/32", NULL), 1);
+     assert_int_equal(amxd_trans_apply(&trans, dm), 0);
+     amxd_trans_clean(&trans);
+diff --git a/test/test_fw_1/test_dm_chain.h b/test/test_fw_1/test_dm_chain.h
+index 854858d..f769872 100644
+--- a/test/test_fw_1/test_dm_chain.h
++++ b/test/test_fw_1/test_dm_chain.h
+@@ -72,6 +72,9 @@ void test_chain_add_log_rule(void** state);
+ void test_chain_rule_with_log_features_denied(void** state);
+ void test_chain_rule_with_log_features_allowed(void** state);
+ void test_rule_ip_or_mask(void** state);
++void test_rule_ip_validation(void** state);
++void test_rule_mask_validation(void** state);
++void test_rule_ip_mask_family_transition(void** state);
+ void test_rule_vendorclassid_and_ipversion(void** state);
+ void test_rule_vendorclassid_and_source(void** state);
+ void test_rule_change_order(void** state);
+diff --git a/test/test_fw_1/test_dm_logs.c b/test/test_fw_1/test_dm_logs.c
+index 69ef615..2a643e5 100644
+--- a/test/test_fw_1/test_dm_logs.c
++++ b/test/test_fw_1/test_dm_logs.c
+@@ -267,12 +267,14 @@ void test_fw_wan_to_lan_rule_logs(UNUSED void** state) {
+     assert_int_equal(amxd_trans_init(&trans), 0);
+     amxd_trans_select_object(&trans, instance);
+     amxd_trans_set_value(bool, &trans, "Enable", true);
++    amxd_trans_set_value(cstring_t, &trans, "DestIP", "192.168.1.2");
+     amxd_trans_set_value(cstring_t, &trans, "DestMask", "192.168.1.0/24");
+     amxd_trans_set_value(bool, &trans, "DestIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "DestPort", 8000);
+     amxd_trans_set_value(int32_t, &trans, "DestPortRangeMax", 8001);
+     amxd_trans_set_value(bool, &trans, "DestPortExclude", true);
+-    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceIP", "10.0.0.1");
++    amxd_trans_set_value(cstring_t, &trans, "SourceMask", "10.0.0.1/32");
+     amxd_trans_set_value(bool, &trans, "SourceIPExclude", true);
+     amxd_trans_set_value(int32_t, &trans, "SourcePort", 7000);
+     amxd_trans_set_value(bool, &trans, "SourcePortExclude", true);
+@@ -322,4 +324,4 @@ void test_fw_wan_to_lan_rule_logs(UNUSED void** state) {
+     handle_events();
+ 
+     amxc_var_clean(&params);
+-}
+\ No newline at end of file
++}
+diff --git a/test/test_fw_1/test_main.c b/test/test_fw_1/test_main.c
+index 8b0fe58..d422647 100644
+--- a/test/test_fw_1/test_main.c
++++ b/test/test_fw_1/test_main.c
+@@ -216,6 +216,9 @@ int main(void) {
+         cmocka_unit_test_setup_teardown(test_chain_status, test_chain_setup, NULL),
+         cmocka_unit_test_setup_teardown(test_source_mac, NULL, NULL),
+         cmocka_unit_test_setup_teardown(test_rule_ip_or_mask, NULL, NULL),
++        cmocka_unit_test_setup_teardown(test_rule_ip_validation, NULL, NULL),
++        cmocka_unit_test_setup_teardown(test_rule_mask_validation, NULL, NULL),
++        cmocka_unit_test_setup_teardown(test_rule_ip_mask_family_transition, NULL, NULL),
+         cmocka_unit_test_setup_teardown(test_rule_change_order, NULL, NULL),
+         cmocka_unit_test_setup_teardown(test_rule_vendorclassid_and_ipversion, NULL, NULL),
+         cmocka_unit_test_setup_teardown(test_rule_vendorclassid_and_source, NULL, NULL),
+-- 
+2.51.0.windows.1
+

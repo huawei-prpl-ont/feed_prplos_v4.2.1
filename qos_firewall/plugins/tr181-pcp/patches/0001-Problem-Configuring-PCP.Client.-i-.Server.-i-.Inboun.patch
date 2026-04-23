@@ -1,0 +1,32 @@
+From b5effb7d8d70b5c0cb3c4ed98ac11a4687fc893f Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Thu, 26 Mar 2026 21:09:11 +0800
+Subject: [PATCH] Problem: Configuring
+ `PCP.Client.{i}.Server.{i}.InboundMapping.{i}.ThirdPartyAddress` with IPv6
+ address has no effect
+
+Cause: In the `add_map` function, during validation of the input parameter `thirdparty_addr`, the incorrect variable `rv` is used to check the value returned in `pton_rv`. This causes the configuration to fail with bad address error.
+
+Solution: Correct variable name in address conversion check.
+
+Issue: PPW-1681 `PCP.Client.{i}.Server.{i}.InboundMapping.{i}.ThirdPartyAddress` Not Applied Due to Validation Error [fix]
+---
+ mod-pcp-libpcp/src/mod_pcp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mod-pcp-libpcp/src/mod_pcp.c b/mod-pcp-libpcp/src/mod_pcp.c
+index d98772a..6af796d 100644
+--- a/mod-pcp-libpcp/src/mod_pcp.c
++++ b/mod-pcp-libpcp/src/mod_pcp.c
+@@ -237,7 +237,7 @@ static bool add_map(server_t* s, map_t* m, amxc_var_t* args) {
+         memset(&sa, 0, sizeof(struct sockaddr_storage));
+ 
+         pton_rv = inet_pton(AF_INET6, thirdparty_addr, &psa6->sin6_addr);
+-        if(rv == 1) {
++        if(pton_rv == 1) {
+             sa.ss_family = AF_INET6;
+         } else {
+             pton_rv = inet_pton(AF_INET, thirdparty_addr, &psa->sin_addr);
+-- 
+2.51.0.windows.1
+
