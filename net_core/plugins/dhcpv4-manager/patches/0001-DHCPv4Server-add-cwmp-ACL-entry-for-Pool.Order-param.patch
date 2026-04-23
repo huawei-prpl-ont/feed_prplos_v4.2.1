@@ -1,0 +1,31 @@
+From 1bbac7c607c64560ecdbbc4b28754ff29778d119 Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Wed, 8 Apr 2026 21:07:31 +0800
+Subject: [PATCH] DHCPv4Server: add cwmp ACL entry for Pool.Order parameter
+ [PPW-1781]
+
+Fixes: PPW-1781
+References: https://prplfoundationcloud.atlassian.net/browse/PPW-1781
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ acl/cwmp/dhcpv4-manager.json | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/acl/cwmp/dhcpv4-manager.json b/acl/cwmp/dhcpv4-manager.json
+index 5e204a7..f479479 100644
+--- a/acl/cwmp/dhcpv4-manager.json
++++ b/acl/cwmp/dhcpv4-manager.json
+@@ -83,6 +83,10 @@
+ 	"Device.DHCPv4.Server.Pool.*.MinAddress": {
+         "Order": 3,
+         "Param": "rw-n"
++    },
++	"Device.DHCPv4.Server.Pool.*.Order": {
++        "Order": 3,
++        "Param": "rw-n"
+     },
+ 	"Device.DHCPv4.Server.Pool.*.ReservedAddresses": {
+         "Order": 3,
+-- 
+2.51.0.windows.1
+

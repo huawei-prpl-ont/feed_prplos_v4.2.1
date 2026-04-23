@@ -1,0 +1,35 @@
+From 71d53ce385961205ca764f5bf83ac16701056b5c Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Thu, 16 Apr 2026 15:44:33 +0800
+Subject: [PATCH] tr181-dhcpv4client: Fix DHCPv4 client mapping scope
+ [PPW-1780]
+
+Problem:
+The mapping currently proxies Device.DHCPv4. to DHCPv4Client, causing
+GetParameterNames on Device.DHCPv4. to return only client nodes and
+omit Device.DHCPv4.Server.
+
+Solution:
+Restrict the mapping to Device.DHCPv4.Client. so only the client
+subtree is handled by DHCPv4Client.
+
+Fixes: PPW-1780
+Reference: https://prplfoundation.atlassian.net/browse/PPW-1780
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ odl/tr181-dhcpv4client_mapping.odl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/odl/tr181-dhcpv4client_mapping.odl b/odl/tr181-dhcpv4client_mapping.odl
+index 319dcba..bf72558 100644
+--- a/odl/tr181-dhcpv4client_mapping.odl
++++ b/odl/tr181-dhcpv4client_mapping.odl
+@@ -1,3 +1,3 @@
+ %config {
+-    %global "proxy-object.'Device.DHCPv4.'" = "DHCPv4Client.";
++    %global "proxy-object.'Device.DHCPv4.Client.'" = "DHCPv4Client.";
+ }
+\ No newline at end of file
+-- 
+2.51.0.windows.1
+

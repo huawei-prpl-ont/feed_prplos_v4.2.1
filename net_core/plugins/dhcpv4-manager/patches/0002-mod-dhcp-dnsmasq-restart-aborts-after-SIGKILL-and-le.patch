@@ -1,0 +1,161 @@
+From fbd160503d1441c2a836595b51a71c1c69ae4956 Mon Sep 17 00:00:00 2001
+From: "LU, Xinbo" <luxinbo4@huawei.com>
+Date: Tue, 14 Apr 2026 11:02:53 +0800
+Subject: [PATCH] mod-dhcp-dnsmasq: restart aborts after SIGKILL and leaves
+ dnsmasq down [PPW-1813]
+
+Problem:
+- dnsmasq could remain down when a restart escalated from SIGTERM to
+SIGKILL due to timeout
+
+Analysis:
+- dnsmasq_control() exited after a successful SIGKILL
+- this skipped the restart path that starts dnsmasq again
+
+Solution:
+- continue into the normal start path after a successful SIGKILL
+- add a regression test for the timeout-then-SIGKILL restart flow
+
+Reference: PPW-1813
+Signed-off-by: LU, Xinbo <luxinbo4@huawei.com>
+---
+ mod-dhcp-dnsmasq/src/mod_dhcp_dnsmasq.c       |  1 -
+ .../test/mocks_dnsmasq/mock_amxp_dnsmasq.c    | 11 ++++++-
+ .../test/mocks_dnsmasq/mock_amxp_dnsmasq.h    |  4 ++-
+ .../test/mod_dnsmasq/test_module.c            | 31 +++++++++++++++++++
+ .../test/mod_dnsmasq/test_module.h            |  1 +
+ .../test/mod_dnsmasq/test_module_main.c       |  1 +
+ 6 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/mod-dhcp-dnsmasq/src/mod_dhcp_dnsmasq.c b/mod-dhcp-dnsmasq/src/mod_dhcp_dnsmasq.c
+index 0b2a522..2941d5d 100644
+--- a/mod-dhcp-dnsmasq/src/mod_dhcp_dnsmasq.c
++++ b/mod-dhcp-dnsmasq/src/mod_dhcp_dnsmasq.c
+@@ -228,7 +228,6 @@ static void dnsmasq_control(UNUSED amxp_timer_t* timer, UNUSED void* priv) {
+             when_failed_trace(retval, exit, ERROR, "Failed to kill the subproc with SIGKILL %s (%d) %d", strerror(errno), errno, retval);
+             retval = amxp_subproc_wait(dnsmasq.subproc, KILL_TIMEOUT_IN_MSEC);
+             when_failed_trace(retval, exit, ERROR, "SIGKILL timed out.");
+-            goto exit;
+         }
+     }
+ 
+diff --git a/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.c b/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.c
+index c12a632..3759ec0 100644
+--- a/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.c
++++ b/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.c
+@@ -65,6 +65,7 @@
+ 
+ static bool process_started = false;
+ static int restarted = 0;
++static int wait_failures = 0;
+ 
+ // Function
+ // wrapper
+@@ -82,6 +83,10 @@ int __wrap_amxp_subproc_kill(const amxp_subproc_t* const subproc, const int sig)
+ int __wrap_amxp_subproc_wait(amxp_subproc_t* subproc, int timeout_msec) {
+     assert_non_null(subproc);
+     assert_false(timeout_msec <= 0);
++    if(wait_failures > 0) {
++        wait_failures--;
++        return -1;
++    }
+     return 0;
+ }
+ 
+@@ -105,4 +110,8 @@ bool mock_amxp_subproc_restarted() {
+     int ret = restarted;
+     restarted = 0;
+     return ret == 2;
+-}
+\ No newline at end of file
++}
++
++void mock_amxp_subproc_timeout_once() {
++    wait_failures = 1;
++}
+diff --git a/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.h b/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.h
+index 456e74c..073cc17 100644
+--- a/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.h
++++ b/mod-dhcp-dnsmasq/test/mocks_dnsmasq/mock_amxp_dnsmasq.h
+@@ -90,8 +90,10 @@ bool mock_amxp_subproc_started(void);
+ 
+ bool mock_amxp_subproc_restarted(void);
+ 
++void mock_amxp_subproc_timeout_once(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+-#endif // __MOCK_AMXP_DNSMASQ_H__
+\ No newline at end of file
++#endif // __MOCK_AMXP_DNSMASQ_H__
+diff --git a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.c b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.c
+index 6eaf594..f0fe9a3 100644
+--- a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.c
++++ b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.c
+@@ -217,6 +217,37 @@ void test_control_back_end(UNUSED void** state) {
+     amxc_var_clean(&pool_config);
+ }
+ 
++void test_control_back_end_sigkill_restart(UNUSED void** state) {
++    amxc_var_t config;
++    amxc_var_t ret;
++    amxc_var_t pool_config;
++
++    amxc_var_init(&config);
++    amxc_var_init(&ret);
++    amxc_var_init(&pool_config);
++    amxc_var_set_type(&config, AMXC_VAR_ID_HTABLE);
++    amxc_var_set_type(&pool_config, AMXC_VAR_ID_HTABLE);
++
++    fill_server_config(&config, true, true, true);
++    fill_pool_data(&pool_config, "dummy", 1, "dummy-lan", "192.168.1.2", "192.168.1.250", "255.255.255.0", 360);
++    fill_pool_filter(&pool_config, true, "test", "Exact", false, "11:22:33:44:55:66", "ff:ff:ff:00:00:00", false, "All", NULL);
++
++    assert_int_equal(enable_dhcp_pool_dnsmasq(NULL, &pool_config, &ret), 0);
++    assert_int_equal(start_dnsmasq(NULL, &config, &ret), 0);
++    amxut_timer_go_to_future_ms(10000);
++    assert_true(mock_amxp_subproc_started());
++
++    mock_amxp_subproc_timeout_once();
++    assert_int_equal(enable_dhcp_pool_dnsmasq(NULL, &pool_config, &ret), 0);
++    amxut_timer_go_to_future_ms(10000);
++    assert_true(mock_amxp_subproc_started());
++    assert_true(mock_amxp_subproc_restarted());
++
++    amxc_var_clean(&config);
++    amxc_var_clean(&ret);
++    amxc_var_clean(&pool_config);
++}
++
+ /**
+  * @brief
+  * Test done :
+diff --git a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.h b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.h
+index 117fb8c..ca11f7c 100644
+--- a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.h
++++ b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module.h
+@@ -64,6 +64,7 @@
+ #define __TEST_MODULE_H__
+ 
+ void test_control_back_end(void** state);
++void test_control_back_end_sigkill_restart(void** state);
+ void test_dhcp_pool(void** state);
+ void test_static_ip(void** state);
+ void test_clean_leases(void** state);
+diff --git a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module_main.c b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module_main.c
+index 288efcb..2fa8840 100644
+--- a/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module_main.c
++++ b/mod-dhcp-dnsmasq/test/mod_dnsmasq/test_module_main.c
+@@ -70,6 +70,7 @@
+ int main(void) {
+     const struct CMUnitTest tests[] = {
+         cmocka_unit_test(test_control_back_end),
++        cmocka_unit_test(test_control_back_end_sigkill_restart),
+         cmocka_unit_test(test_dhcp_pool),
+         cmocka_unit_test(test_static_ip),
+         cmocka_unit_test(test_backup_leases),
+-- 
+2.51.0.windows.1
+
